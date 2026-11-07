@@ -53,7 +53,7 @@ func awaitArtifactReadinessResult(ctx context.Context, result <-chan error) erro
 // launchArtifactSandbox owns the host half of the exact-run two-stage protocol.
 // The conductor consumes only the task's non-secret summary; it never opens or
 // parses a tenant Artifact.
-func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) (retErr error) {
+func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation, timeline *launchTimeline) (retErr error) {
 	prepareStarted := time.Now()
 	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -63,6 +63,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
 		return launchFailed("artifact_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
 	}
+	// restore 路径 host 侧入口准备极短，先落 node_prepare_done 锚点；
+	// 两段式 snapshot prepare 归入后续 dispatch/pre_ch 相位。
+	timeline.point("node_prepare_done", time.Now())
 
 	// The listener exists before assignment becomes visible. node-ctl connects
 	// immediately after WaitAssignment, making a task exit during root reading an
@@ -74,6 +77,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	defer readyListener.Close()
 
 	assignStarted := time.Now()
+	timeline.point("runner_assign_start", assignStarted)
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
 	resourcePool := ""
@@ -82,6 +86,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	}
 	runID, err := o.runnerPool.assignInResourcePool(assignmentCtx, resourcePool, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
+		timeline.point("runner_commit_start", commitStarted)
 		unlock := o.lifecycle.Lock(sb.ID)
 		defer unlock()
 		changed, err := o.st.BindStartingRunner(ctx, sb.ID, runID)
@@ -104,6 +109,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		o.publishUpsert(bound)
 		o.observeSandboxUpsert(bound)
 		commitFinished = time.Now()
+		timeline.point("runner_commit_done", commitFinished)
 		return nil
 	})
 	cancelAssignment()
@@ -126,6 +132,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		attempt.SetRunID(runID)
 	}
 	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
+	timeline.point("runner_handoff_done", time.Now())
 
 	launchCtx, cancelLaunch := context.WithCancel(ctx)
 	if deadline := attempt.Deadline(); !deadline.IsZero() {
@@ -141,10 +148,10 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	}()
 
 	readinessResult := make(chan error, 1)
+	var runtimeTiming *configsock.ReadinessTiming // 与 readinessResult 的通道收发构成 happens-before，读侧安全
 	go func() {
-		readyErr := waitRuntimeReadiness(launchCtx, readyListener)
-		// Publication must precede cancellation; awaitArtifactReadinessResult
-		// relies on this boundary to preserve the concrete readiness failure.
+		t, readyErr := waitRuntimeReadinessTiming(launchCtx, readyListener)
+		runtimeTiming = t
 		readinessResult <- readyErr
 		if readyErr != nil {
 			cancelLaunch()
@@ -259,7 +266,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 				next := *preparation
 				next.Placement = &claim
 				next.Prepared = &summary
-				return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, &next)
+				return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, &next, timeline)
 			}
 			preparation.Placement = &claim
 		}
@@ -338,17 +345,33 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 
 	runtimeStarted := time.Now()
 	err = awaitArtifactReadinessResult(launchCtx, readinessResult)
+	timeline.point("runtime_ready_received", time.Now())
+	if runtimeTiming != nil {
+		if runtimeTiming.SandboxCtlStartUnixNs != 0 {
+			timeline.point("sandbox_ctl_start", time.Unix(0, runtimeTiming.SandboxCtlStartUnixNs))
+		}
+		if runtimeTiming.CHStartUnixNs != 0 {
+			timeline.point("ch_start", time.Unix(0, runtimeTiming.CHStartUnixNs))
+		}
+		if runtimeTiming.CHResumeDoneUnixNs != 0 {
+			timeline.point("ch_resume_done", time.Unix(0, runtimeTiming.CHResumeDoneUnixNs))
+		}
+		if runtimeTiming.SandboxInitAckUnixNs != 0 {
+			timeline.point("sandbox_init_ack", time.Unix(0, runtimeTiming.SandboxInitAckUnixNs))
+		}
+	}
 	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
 	if tmpl.Profile == types.ProfileE2B {
 		envdStarted := time.Now()
-		err = o.envdInit(launchCtx, sb)
+		err = o.envdInit(launchCtx, sb, timeline)
 		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
 		if err != nil {
 			return launchFailed("init", err)
 		}
+		timeline.point("envd_init_done", time.Now())
 	}
 
 	unlock = o.lifecycle.Lock(sb.ID)

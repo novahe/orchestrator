@@ -50,14 +50,19 @@ func (l *runtimeReadinessListener) Close() {
 // complete sandbox-ctl event stream. Closing the listener/connection is what
 // interrupts the otherwise blocking Unix reads when the launch context expires.
 func waitRuntimeReadiness(ctx context.Context, l *runtimeReadinessListener) error {
+	_, err := waitRuntimeReadinessTiming(ctx, l)
+	return err
+}
+
+func waitRuntimeReadinessTiming(ctx context.Context, l *runtimeReadinessListener) (*configsock.ReadinessTiming, error) {
 	stopAcceptCancel := context.AfterFunc(ctx, l.Close)
 	conn, err := l.listener.AcceptUnix()
 	stopAcceptCancel()
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
-		return fmt.Errorf("accept readiness connection: %w", err)
+		return nil, fmt.Errorf("accept readiness connection: %w", err)
 	}
 	// The bridge is one-shot. No later connection may replace or augment the
 	// event stream selected for this launch.
@@ -65,13 +70,13 @@ func waitRuntimeReadiness(ctx context.Context, l *runtimeReadinessListener) erro
 	defer conn.Close()
 
 	stopReadCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	err = configsock.ReadReadiness(conn)
+	timing, err := configsock.ReadReadinessTiming(conn)
 	stopReadCancel()
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	if err != nil {
-		return fmt.Errorf("runtime readiness protocol: %w", err)
+		return nil, fmt.Errorf("runtime readiness protocol: %w", err)
 	}
-	return nil
+	return timing, nil
 }

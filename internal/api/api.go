@@ -1433,6 +1433,12 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d["endAt"] = isoUnix(sandboxEndUnix(sb))
 	d["metadata"] = sb.Metadata
 	addSandboxTerminalFields(d, sb)
+	if sb.LaunchDurationMs > 0 {
+		d["launchMs"] = sb.LaunchDurationMs // server-measured accepted→terminal launch wall (ms)
+	}
+	if sb.LaunchTiming != nil {
+		d["launchTiming"] = sb.LaunchTiming
+	}
 	return d
 }
 

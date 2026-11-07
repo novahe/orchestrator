@@ -31,6 +31,7 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
 		wantCtxErr bool
 	}{
 		{name: "exact", wire: "control_ready\nready\n"},
+		{name: "timing", wire: "control_ready\nready\t{\"version\":1,\"sandbox_ctl_start_unix_ns\":100,\"ch_start_unix_ns\":200}\n"},
 		{name: "EOF before control", wire: "", wantErr: true},
 		{name: "EOF before ready", wire: "control_ready\n", wantErr: true},
 		{name: "unknown", wire: "unknown\nready\n", wantErr: true},
@@ -391,7 +392,7 @@ func TestEnvdInitPayloadPreservesMMDSCredentialPolicy(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			if err := o.envdInit(ctx, sb); err != nil {
+			if err := o.envdInit(ctx, sb, nil); err != nil {
 				t.Fatal(err)
 			}
 			got := <-observed
@@ -444,7 +445,7 @@ func TestEnvdInitAllowsSlowRequestWithinSharedDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	if err := o.envdInit(ctx, sb); err != nil {
+	if err := o.envdInit(ctx, sb, newLaunchTimeline(sb.Profile, time.Now())); err != nil {
 		t.Fatal(err)
 	}
 	if got := attempts.Load(); got != 1 {
@@ -477,7 +478,7 @@ func TestEnvdInitRetriesOnlyTransportErrors(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := o.envdInit(ctx, sb); err != nil {
+	if err := o.envdInit(ctx, sb, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -503,7 +504,7 @@ func TestEnvdInitNon204FailsWithoutRetryOrResponseDetail(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := o.envdInit(ctx, sb)
+	err := o.envdInit(ctx, sb, nil)
 	if err == nil || !strings.Contains(err.Error(), "status 503") || strings.Contains(err.Error(), "temporary init failure") {
 		t.Fatalf("envd /init error = %v", err)
 	}

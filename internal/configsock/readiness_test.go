@@ -12,6 +12,21 @@ func TestReadinessSocketPath(t *testing.T) {
 	}
 }
 
+func TestReadReadinessTiming(t *testing.T) {
+	wire := "control_ready\nready\t{\"version\":1,\"sandbox_ctl_start_unix_ns\":100,\"ch_start_unix_ns\":200,\"ch_resume_done_unix_ns\":300,\"sandbox_init_ack_unix_ns\":400}\n"
+	timing, err := ReadReadinessTiming(strings.NewReader(wire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timing == nil || timing.Version != 1 || timing.SandboxCtlStartUnixNs != 100 || timing.CHStartUnixNs != 200 || timing.CHResumeDoneUnixNs != 300 || timing.SandboxInitAckUnixNs != 400 {
+		t.Fatalf("timing = %+v, want all wire points", timing)
+	}
+	legacy, err := ReadReadinessTiming(strings.NewReader("control_ready\nready\n"))
+	if err != nil || legacy != nil {
+		t.Fatalf("legacy timing = %+v, err=%v, want nil timing and nil error", legacy, err)
+	}
+}
+
 func TestReadReadiness(t *testing.T) {
 	tests := []struct {
 		name    string

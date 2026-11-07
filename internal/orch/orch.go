@@ -76,6 +76,9 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
+	launchDur    sync.Map // sid -> float64 ms: server-measured accepted→terminal launch wall (exposed via GET launchMs)
+	launchTiming sync.Map // sid -> *types.LaunchTiming: in-memory launch points/phases
+
 	launches          launchGroup            // sole process-local owner of create and resume attempts
 	acceptedOps       acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
 	buildWake         chan struct{}
@@ -520,8 +523,87 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
 		"duration", duration)
 }
 
+type launchTimeline struct {
+	profile types.Profile
+	points  map[string]time.Time
+}
+
+func newLaunchTimeline(profile types.Profile, acceptedAt time.Time) *launchTimeline {
+	t := &launchTimeline{profile: profile, points: map[string]time.Time{}}
+	if !acceptedAt.IsZero() {
+		t.points["accepted"] = acceptedAt
+	}
+	return t
+}
+
+func (t *launchTimeline) point(name string, at time.Time) {
+	if t == nil || at.IsZero() {
+		return
+	}
+	t.points[name] = at
+}
+
+func (t *launchTimeline) export(launchMs float64) *types.LaunchTiming {
+	if t == nil {
+		return nil
+	}
+	out := &types.LaunchTiming{
+		Profile:  t.profile,
+		Points:   map[string]string{},
+		PhasesMs: map[string]float64{},
+	}
+	for name, at := range t.points {
+		out.Points[name] = at.UTC().Format(time.RFC3339Nano)
+	}
+	add := func(name, from, to string, accounted bool) {
+		a, aok := t.points[from]
+		b, bok := t.points[to]
+		if !aok || !bok || b.Before(a) {
+			return
+		}
+		out.PhasesMs[name] = float64(b.Sub(a).Microseconds()) / 1000.0
+		if accounted {
+			out.AccountedMs += out.PhasesMs[name]
+		}
+	}
+	add("admission_to_node_prepare", "accepted", "node_prepare_done", true)
+	add("runner_wait", "runner_assign_start", "runner_commit_start", true)
+	add("runner_commit", "runner_commit_start", "runner_commit_done", true)
+	add("runner_handoff", "runner_commit_done", "runner_handoff_done", true)
+	add("sandbox_ctl_dispatch", "runner_handoff_done", "sandbox_ctl_start", true)
+	add("sandbox_ctl_pre_ch", "sandbox_ctl_start", "ch_start", true)
+	if _, ok := t.points["ch_resume_done"]; ok {
+		add("ch_start_to_resume", "ch_start", "ch_resume_done", true)
+		add("resume_to_sandbox_init_ack", "ch_resume_done", "sandbox_init_ack", true)
+		add("sandbox_init_ack_to_runtime_ready", "sandbox_init_ack", "runtime_ready_received", true)
+	} else {
+		add("ch_start_to_runtime_ready", "ch_start", "runtime_ready_received", true)
+	}
+	if _, ok := t.points["envd_init_done"]; ok {
+		// Keep the historical gate phase as the accounted envd interval. The
+		// attempt phases below are nested diagnostics and are not accounted a
+		// second time.
+		add("runtime_ready_to_envd_init_done", "runtime_ready_received", "envd_init_done", true)
+		add("envd_init_to_launch_done", "envd_init_done", "launch_done", true)
+		if _, ok := t.points["envd_init_attempt1_done"]; ok {
+			// 首试（拨号+握手+guest 处理）与重试尾巴分开；无重试时尾巴≈0
+			add("envd_attempt1", "runtime_ready_received", "envd_init_attempt1_done", false)
+			add("envd_retry_tail", "envd_init_attempt1_done", "envd_init_done", false)
+		}
+	} else {
+		add("runtime_ready_to_launch_done", "runtime_ready_received", "launch_done", true)
+	}
+	out.UnaccountedMs = launchMs - out.AccountedMs
+	return out
+}
+
 func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) error {
-	err := o.launchSandbox(ctx, attempt, sb, tmpl, preparation)
+	acceptedAt := attempt.AcceptedAt()
+	if acceptedAt.IsZero() {
+		acceptedAt = time.Now()
+	}
+	timeline := newLaunchTimeline(sb.Profile, acceptedAt)
+	err := o.launchSandbox(ctx, attempt, sb, tmpl, timeline, preparation)
 	result := "success"
 	failureStage := ""
 	if err != nil {
@@ -531,10 +613,13 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
 			err = errors.Join(err, rollbackErr)
 		}
 	}
-	acceptedAt := attempt.AcceptedAt()
-	if acceptedAt.IsZero() {
-		acceptedAt = time.Now()
-	}
+	launchDone := time.Now()
+	timeline.point("launch_done", launchDone)
+	launchDur := launchDone.Sub(acceptedAt)
+	o.launchDur.Store(sb.ID, float64(launchDur.Microseconds())/1000.0) // server-measured ms, exposed via GET launchMs
+	launchMs := float64(launchDur.Microseconds()) / 1000.0
+	timing := timeline.export(launchMs)
+	o.launchTiming.Store(sb.ID, timing)
 	o.log.Info("sandbox launch terminal",
 		"sid", sb.ID,
 		"run_id", attempt.RunID(),
@@ -542,7 +627,9 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
 		"profile", sb.Profile,
 		"result", result,
 		"failure_stage", failureStage,
-		"starting_total_duration", time.Since(acceptedAt),
+		"starting_total_duration", launchDur,
+		"launch_timing", timing,
+
 		"err", err)
 	if err == nil {
 		o.requestDiskCheckpointRelease(sb.ID)
@@ -553,7 +640,7 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
 // launchSandbox prepares all runner handoff inputs, then spends separate runner
 // assignment and runtime readiness budgets. The durable starting row already
 // exists and is never replaced by a stale whole-row Put.
-func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) error {
+func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, timeline *launchTimeline, preparation *launchPreparation) error {
 	if sb == nil || attempt == nil || sb.State != types.StateStarting || sb.ID != attempt.SID() {
 		return launchFailed("prepare", fmt.Errorf("orch: launch requires its claimed starting sandbox"))
 	}
@@ -561,7 +648,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
 	}
 	if !preparation.Source.Empty() {
-		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation)
+		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation, timeline)
 	}
 	prepareStarted := time.Now()
 	prepareLogged := false
@@ -640,14 +727,17 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	}
 	o.logLaunchPhase(attempt, sb, "prepare_duration", time.Since(prepareStarted))
 	prepareLogged = true
+	timeline.point("node_prepare_done", time.Now())
 
 	// Binding precedes assignment so node-ctl can connect immediately after its
 	// long-poll returns; no retry window is needed between the two processes.
 	assignStarted := time.Now()
+	timeline.point("runner_assign_start", assignStarted)
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
 	runID, err := o.assignSandboxRunner(assignmentCtx, sb, preparation.Resources, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
+		timeline.point("runner_commit_start", commitStarted)
 		// Serialize the runner-binding linearization point with Kill/Delete and
 		// other lifecycle mutations. If deletion wins, the exact CAS below misses
 		// and the pool never hands the task to this runner; if binding wins, the
@@ -678,6 +768,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		o.publishUpsert(bound)
 		o.observeSandboxUpsert(bound)
 		commitFinished = time.Now()
+		timeline.point("runner_commit_done", commitFinished)
 		return nil
 	})
 	cancelAssignment()
@@ -703,6 +794,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		commitFinished = assignStarted
 	}
 	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
+	timeline.point("runner_handoff_done", time.Now())
 	// Readiness and mandatory /init follow the accepted attempt owner. A
 	// positive explicitly supplied budget bounds both phases; ordinary launches
 	// have no extra overall deadline. Assignment and running TTL are separate.
@@ -713,18 +805,35 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	}
 	defer cancelLaunch()
 	runtimeStarted := time.Now()
-	err = waitRuntimeReadiness(launchCtx, readyListener)
+	runtimeTiming, err := waitRuntimeReadinessTiming(launchCtx, readyListener)
+	runtimeReadyReceived := time.Now()
+	timeline.point("runtime_ready_received", runtimeReadyReceived)
+	if runtimeTiming != nil {
+		if runtimeTiming.SandboxCtlStartUnixNs != 0 {
+			timeline.point("sandbox_ctl_start", time.Unix(0, runtimeTiming.SandboxCtlStartUnixNs))
+		}
+		if runtimeTiming.CHStartUnixNs != 0 {
+			timeline.point("ch_start", time.Unix(0, runtimeTiming.CHStartUnixNs))
+		}
+		if runtimeTiming.CHResumeDoneUnixNs != 0 {
+			timeline.point("ch_resume_done", time.Unix(0, runtimeTiming.CHResumeDoneUnixNs))
+		}
+		if runtimeTiming.SandboxInitAckUnixNs != 0 {
+			timeline.point("sandbox_init_ack", time.Unix(0, runtimeTiming.SandboxInitAckUnixNs))
+		}
+	}
 	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
 	if tmpl.Profile == types.ProfileE2B {
 		envdStarted := time.Now()
-		err = o.envdInit(launchCtx, sb)
+		err = o.envdInit(launchCtx, sb, timeline)
 		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
 		if err != nil {
 			return launchFailed("envd", err)
 		}
+		timeline.point("envd_init_done", time.Now())
 	}
 	unlock = o.lifecycle.Lock(sb.ID)
 	defer unlock()
@@ -1131,6 +1240,13 @@ func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandb
 	if !ownsSandbox(sb, apiKey) {
 		return nil, api.ErrNotFound
 	}
+	if v, ok := o.launchDur.Load(id); ok {
+		sb.LaunchDurationMs = v.(float64) // in-memory only; not persisted
+	}
+	if v, ok := o.launchTiming.Load(id); ok {
+		sb.LaunchTiming = v.(*types.LaunchTiming) // in-memory only; not persisted
+	}
+
 	return sb, nil
 }
 
@@ -3307,7 +3423,7 @@ func envdInitRetryDelay(failures int) time.Duration {
 // and the proxy already enforces X-Access-Token as the sole gate. With MMDS enabled
 // (FC mode) the metadata service authorizes this token's hash, so /init re-keys envd
 // to it — giving forks fresh per-identity tokens with envd-side enforcement too.
-func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
+func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox, timeline *launchTimeline) error {
 	cl := udsClient(sb.EnvdUDS)
 	defer cl.CloseIdleConnections()
 
@@ -3330,7 +3446,23 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 			return fmt.Errorf("orch: create envd /init for %s: %w", sb.ID, err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		attemptStart := time.Now()
 		resp, err := cl.Do(req)
+		if failures == 0 {
+			// 首试含 UDS 拨号 + vsock 首连握手 + guest envd 处理，是相位主体；
+			// 单独落点用于把 runtime_ready→envd_init_done 拆成首试与重试尾巴。
+			timeline.point("envd_init_attempt1_done", time.Now())
+			if o.log != nil {
+				o.log.Info("envd init attempt1",
+					"sid", sb.ID, "dur_ms", float64(time.Since(attemptStart).Microseconds())/1000.0, "err", err)
+			}
+		} else {
+			if o.log != nil {
+				o.log.Info("envd init retry",
+					"sid", sb.ID, "attempt", failures+1,
+					"dur_ms", float64(time.Since(attemptStart).Microseconds())/1000.0, "err", err)
+			}
+		}
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusNoContent {

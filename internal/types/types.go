@@ -225,6 +225,18 @@ const (
 	StateDead     State = "dead"
 )
 
+// LaunchTiming is the server-side launch timeline exposed in GET sandbox
+// details. Points are RFC3339Nano strings so the API remains readable and
+// phasesMs are directly comparable with launchMs. Missing phases are expected
+// on paths that do not execute them (for example envd on bare).
+type LaunchTiming struct {
+	Profile       Profile            `json:"profile"`
+	Points        map[string]string  `json:"points"`
+	PhasesMs      map[string]float64 `json:"phasesMs"`
+	AccountedMs   float64            `json:"accountedMs"`
+	UnaccountedMs float64            `json:"unaccountedMs"`
+}
+
 // MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.
 const MaxLocalSandboxIDBytes = 57
 
@@ -417,6 +429,8 @@ type Sandbox struct {
 	CreatedUnix           int64
 	DeadUnix              int64 // first durable dead commit; retries never extend retention
 	ExecutionResult       *SandboxExecutionResult
+	LaunchDurationMs      float64       // accepted→terminal wall (server-measured); in-memory only, merged into GET responses
+	LaunchTiming          *LaunchTiming // in-memory launch points/phases, merged into GET responses
 }
 
 // ClusterSandboxContext is trusted node-local ownership state supplied by the
